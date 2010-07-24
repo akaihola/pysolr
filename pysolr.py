@@ -626,7 +626,7 @@ class Solr(object):
                     
                     if boost and key in boost:
                         if not isinstance(boost, basestring):
-                            boost[v] = str(boost[v])
+                            boost[key] = str(boost[key])
                         
                         f = ET.Element('field', name=key, boost=boost[key])
                     else:
