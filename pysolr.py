@@ -121,9 +121,11 @@ document 7
 # TODO: unicode support is pretty sloppy. define it better.
 
 from datetime import datetime
+import htmlentitydefs
 import logging
 import re
 import time
+import types
 import urllib
 import urllib2
 from urlparse import urlsplit, urlunsplit
@@ -167,7 +169,7 @@ except NameError:
 
 __author__ = 'Joseph Kocherhans, Jacob Kaplan-Moss, Daniel Lindsley'
 __all__ = ['Solr']
-__version__ = (2, 0, 13, 'beta')
+__version__ = (2, 0, 15)
 
 def get_version():
     return "%s.%s.%s" % __version__[:3]
@@ -194,6 +196,34 @@ if False:
     LOG.addHandler(stream)
 
 
+def unescape_html(text):
+    """
+    Removes HTML or XML character references and entities from a text string.
+    
+    @param text The HTML (or XML) source text.
+    @return The plain text, as a Unicode string, if necessary.
+
+    Source: http://effbot.org/zone/re-sub.htm#unescape-html
+    """
+    def fixup(m):
+        text = m.group(0)
+        if text[:2] == "&#":
+            # character reference
+            try:
+                if text[:3] == "&#x":
+                    return unichr(int(text[3:-1], 16))
+                else:
+                    return unichr(int(text[2:-1]))
+            except ValueError:
+                pass
+        else:
+            # named entity
+            try:
+                text = unichr(htmlentitydefs.name2codepoint[text[1:-1]])
+            except KeyError:
+                pass
+        return text # leave as is
+    return re.sub("&#?\w+;", fixup, text)
 
 def safe_urlencode(params, doseq=0):
     """
@@ -225,17 +255,19 @@ class SolrError(Exception):
 
 
 class Results(object):
-    def __init__(self, docs, hits, highlighting=None, facets=None, spellcheck=None, stats=None):
+    def __init__(self, docs, hits, highlighting=None, facets=None, spellcheck=None, stats=None, qtime=None, debug=None):
         self.docs = docs
         self.hits = hits
         self.highlighting = highlighting or {}
         self.facets = facets or {}
         self.spellcheck = spellcheck or {}
         self.stats = stats or {}
-
+        self.qtime = qtime
+        self.debug = debug or {}
+    
     def __len__(self):
         return len(self.docs)
-
+    
     def __iter__(self):
         return iter(self.docs)
 
@@ -251,7 +283,7 @@ class Solr(object):
         if len(netloc) == 1:
             self.host, self.port = netloc[0], None
         else:
-            self.host, self.port = netloc
+            self.host, self.port = netloc[0], int(netloc[1])
         self.path = path.rstrip('/')
         self.timeout = timeout
         self.log = self._get_log()
@@ -304,10 +336,11 @@ class Solr(object):
     def _select(self, params):
         # specify json encoding of results
         params['wt'] = 'json'
+        params_encoded = safe_urlencode(params, True)
         
-        if sum([len(p) for p in params]) < 1024:
+        if len(params_encoded) < 1024:
             # Typical case.
-            path = '%s/select/?%s' % (self.path, safe_urlencode(params, True))
+            path = '%s/select/?%s' % (self.path, params_encoded)
             return self._send_request('GET', path)
         else:
             # Handles very long queries by submitting as a POST.
@@ -315,8 +348,7 @@ class Solr(object):
             headers = {
                 'Content-type': 'application/x-www-form-urlencoded; charset=utf-8',
             }
-            body = safe_urlencode(params, True)
-            return self._send_request('POST', path, body=body, headers=headers)
+            return self._send_request('POST', path, body=params_encoded, headers=headers)
     
     def _mlt(self, params):
         params['wt'] = 'json' # specify json encoding of results
@@ -328,7 +360,7 @@ class Solr(object):
         path = '%s/terms/?%s' % (self.path, safe_urlencode(params, True))
         return self._send_request('GET', path)
     
-    def _update(self, message, clean_ctrl_chars=True, commit=True):
+    def _update(self, message, clean_ctrl_chars=True, commit=True, waitFlush=None, waitSearcher=None):
         """
         Posts the given xml message to http://<host>:<port>/solr/update and
         returns the result.
@@ -343,8 +375,16 @@ class Solr(object):
         # Per http://wiki.apache.org/solr/UpdateXmlMessages, we can append a
         # ``commit=true`` to the URL and have the commit happen without a
         # second request.
-        if commit:
-            path += '?commit=true'
+        query_vars = []
+        if commit is not None:
+            query_vars.append('commit=%s' % str(bool(commit)).lower())
+        if waitFlush is not None:
+            query_vars.append('waitFlush=%s' % str(bool(waitFlush)).lower())
+        if waitSearcher is not None:
+            query_vars.append('waitSearcher=%s' % str(bool(waitSearcher)).lower())
+        if query_vars:
+            path = '%s?%s' % (path, '&'.join(query_vars))
+            
         
         # Clean the message of ctrl characters.
         if clean_ctrl_chars:
@@ -365,7 +405,7 @@ class Solr(object):
         msg = "[Reason: %s]" % reason
         
         if reason is None:
-            msg += "\n%s" % full_html
+            msg += "\n%s" % unescape_html(full_html)
         
         return msg
     
@@ -375,12 +415,12 @@ class Solr(object):
         """
         # identify the responding server
         server_type = None
-        server_string = headers.get('server', None)
+        server_string = headers.get('server', '')
         
-        if 'jetty' in server_string.lower():
+        if server_string and 'jetty' in server_string.lower():
             server_type = 'jetty'
         
-        if 'coyote' in server_string.lower():
+        if server_string and 'coyote' in server_string.lower():
             # TODO: During the pysolr 3 effort, make this no longer a
             #       conditional and consider using ``lxml.html`` instead.
             from BeautifulSoup import BeautifulSoup
@@ -515,6 +555,9 @@ class Solr(object):
         result = self.decoder.decode(response)
         result_kwargs = {}
         
+        if result.get('debug'):
+            result_kwargs['debug'] = result['debug']
+        
         if result.get('highlighting'):
             result_kwargs['highlighting'] = result['highlighting']
         
@@ -526,6 +569,9 @@ class Solr(object):
         
         if result.get('stats'):
             result_kwargs['stats'] = result['stats']
+        
+        if 'QTime' in result.get('responseHeader', {}):
+            result_kwargs['qtime'] = result['responseHeader']['QTime']
         
         self.log.debug("Found '%s' search results." % result['response']['numFound'])
         return Results(result['response']['docs'], result['response']['numFound'], **result_kwargs)
@@ -573,10 +619,15 @@ class Solr(object):
         terms = result.get("terms", {})
         res = {}
         
-        while terms:
-            # The raw values are a flat list: ["dance",23,"dancers",10,"dancing",8,"dancer",6]]
-            field = terms.pop(0)
-            values = terms.pop(0)
+        # in Solr 1.x the value of terms is a flat list: 
+        #   ["field_name", ["dance",23,"dancers",10,"dancing",8,"dancer",6]]
+        #
+        # in Solr 3.x the value of terms is a dict: 
+        #   {"field_name": ["dance",23,"dancers",10,"dancing",8,"dancer",6]}
+        if isinstance(terms, types.ListType):
+            terms = dict(zip(terms[0::2], terms[1::2]))
+    
+        for field, values in terms.iteritems():
             tmp = list()
             
             while values:
@@ -587,14 +638,15 @@ class Solr(object):
         self.log.debug("Found '%d' Term suggestions results.", sum(len(j) for i, j in res.items()))
         return res
     
-    def add(self, docs, commit=True, boost=None):
+    def add(self, docs, commit=True, boost=None, commitWithin=None, waitFlush=None, waitSearcher=None):
         """Adds or updates documents. For now, docs is a list of dictionaries
         where each key is the field name and each value is the value to index.
         """
         start_time = time.time()
         self.log.debug("Starting to build add request...")
         message = ET.Element('add')
-        
+        if commitWithin:
+            message.set('commitWithin', commitWithin)
         for doc in docs:
             d = ET.Element('doc')
             
@@ -631,17 +683,18 @@ class Solr(object):
                         f = ET.Element('field', name=key, boost=boost[key])
                     else:
                         f = ET.Element('field', name=key)
+                    
                     f.text = self._from_python(value)
                     d.append(f)
             
             message.append(d)
         
-        m = ET.tostring(message, 'utf-8')
+        m = ET.tostring(message, encoding='utf-8')
         end_time = time.time()
         self.log.debug("Built add request of %s docs in %0.2f seconds." % (len(docs), end_time - start_time))
-        response = self._update(m, commit=commit)
+        response = self._update(m, commit=commit, waitFlush=waitFlush, waitSearcher=waitSearcher)
     
-    def delete(self, id=None, q=None, commit=True, fromPending=True, fromCommitted=True):
+    def delete(self, id=None, q=None, commit=True, waitFlush=None, waitSearcher=None):
         """Deletes documents."""
         if id is None and q is None:
             raise ValueError('You must specify "id" or "q".')
@@ -652,13 +705,21 @@ class Solr(object):
         elif q is not None:
             m = '<delete><query>%s</query></delete>' % q
         
-        response = self._update(m, commit=commit)
+        response = self._update(m, commit=commit, waitFlush=waitFlush, waitSearcher=waitSearcher)
     
-    def commit(self):
-        response = self._update('<commit />')
+    def commit(self, waitFlush=None, waitSearcher=None, expungeDeletes=None):
+        if expungeDeletes is not None:
+            msg = '<commit expungeDeletes="%s" />' % str(bool(expungeDeletes)).lower()
+        else:
+            msg = '<commit />'
+        response = self._update(msg, waitFlush=waitFlush, waitSearcher=waitSearcher)
     
-    def optimize(self):
-        response = self._update('<optimize />')
+    def optimize(self, waitFlush=None, waitSearcher=None, maxSegments=None):
+        if maxSegments:
+            msg = '<commit maxSegments="%d" />' % maxSegments
+        else:
+            msg = '<commit />'
+        response = self._update('<optimize />', waitFlush=waitFlush, waitSearcher=waitSearcher)
 
 
 class SolrCoreAdmin(object):
